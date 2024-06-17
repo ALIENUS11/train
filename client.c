@@ -2,167 +2,101 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <sys/socket.h>
 #include <arpa/inet.h>
 #include <pthread.h>
-#include <time.h>
 
 #define PORT 33333
+#define SERVER_ADDRESS "127.0.0.1" // 修改为实际服务器IP地址
 
-// Base64 解码函数
-unsigned char *base64_decode(const char *data, size_t input_length, size_t *output_length) {
-    static const unsigned char decoding_table[] = {
-        64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
-        64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
-        64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 62, 64, 64, 64, 63,
-        52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 64, 64, 64, 0, 64, 64,
-        64, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 64, 64, 64, 64, 64,
-        64, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
-        40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 64, 64, 64, 64, 64
-    };
+// Base64编码函数，简化了实现，可以根据需要替换为更完善的版本
+char *base64_encode(const unsigned char *data, size_t input_length, size_t *output_length) {
+    static const char encoding_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    static const char padding_char = '=';
+    *output_length = 4 * ((input_length + 2) / 3);
 
-    if (input_length % 4 != 0) return NULL;
-
-    *output_length = input_length / 4 * 3;
-    if (data[input_length - 1] == '=') (*output_length)--;
-    if (data[input_length - 2] == '=') (*output_length)--;
-
-    unsigned char *decoded_data = malloc(*output_length);
-    if (decoded_data == NULL) return NULL;
+    char *encoded_data = malloc(*output_length + 1);
+    if (encoded_data == NULL) return NULL;
 
     for (size_t i = 0, j = 0; i < input_length;) {
-        uint32_t sextet_a = data[i] == '=' ? 0 & i++ : decoding_table[(unsigned char)data[i++]];
-        uint32_t sextet_b = data[i] == '=' ? 0 & i++ : decoding_table[(unsigned char)data[i++]];
-        uint32_t sextet_c = data[i] == '=' ? 0 & i++ : decoding_table[(unsigned char)data[i++]];
-        uint32_t sextet_d = data[i] == '=' ? 0 & i++ : decoding_table[(unsigned char)data[i++]];
+        uint32_t octet_a = i < input_length ? (unsigned char)data[i++] : 0;
+        uint32_t octet_b = i < input_length ? (unsigned char)data[i++] : 0;
+        uint32_t octet_c = i < input_length ? (unsigned char)data[i++] : 0;
+        uint32_t triple = (octet_a << 16) | (octet_b << 8) | octet_c;
 
-        uint32_t triple = (sextet_a << 18) + (sextet_b << 12) + (sextet_c << 6) + sextet_d;
-
-        if (j < *output_length) decoded_data[j++] = (triple >> 16) & 0xFF;
-        if (j < *output_length) decoded_data[j++] = (triple >> 8) & 0xFF;
-        if (j < *output_length) decoded_data[j++] = triple & 0xFF;
+        encoded_data[j++] = encoding_table[(triple >> 18) & 0x3F];
+        encoded_data[j++] = encoding_table[(triple >> 12) & 0x3F];
+        encoded_data[j++] = encoding_table[(triple >> 6) & 0x3F];
+        encoded_data[j++] = encoding_table[triple & 0x3F];
     }
 
-    return decoded_data;
-}
-
-// 获取当前时间字符串
-void current_time_str(char *buffer, size_t size) {
-    time_t rawtime;
-    struct tm *timeinfo;
-    time(&rawtime);
-    timeinfo = localtime(&rawtime);
-    strftime(buffer, size, "%Y-%m-%d %H:%M:%S", timeinfo);
-}
-
-// 将消息写入文件
-void write_message_to_file(const char *fromname, const char *toname, const char *message) {
-    FILE *file = fopen("messages.txt", "a");
-    if (!file) {
-        perror("Failed to open messages file");
-        return;
+    for (size_t i = 0; i < (input_length % 3); i++) {
+        encoded_data[*output_length - 1 - i] = padding_char;
     }
 
-    char time_buffer[64];
-    current_time_str(time_buffer, sizeof(time_buffer));
-    fprintf(file, "Time: %s\nFrom: %s\nTo: %s\nMessage: %s\n\n", time_buffer, fromname, toname, message);
-    fclose(file);
+    encoded_data[*output_length] = '\0';
+    return encoded_data;
 }
 
-// 处理客户端连接的线程函数
-void *handle_client(void *arg) {
-    int client_sock = *((int *)arg);
-    free(arg);
+// 发送消息到服务器
+void send_message(const char *fromname, const char *toname, const char *message) {
+    int sock;
+    struct sockaddr_in server_addr;
     char buffer[4096];
 
-    while (1) {
-        memset(buffer, 0, sizeof(buffer));
-        int bytes_received = recv(client_sock, buffer, sizeof(buffer), 0);
-
-        if (bytes_received <= 0) {
-            printf("Client disconnected or error occurred.\n");
-            break;
-        }
-
-        char *fromname = strtok(buffer, "|");
-        char *toname = strtok(NULL, "|");
-        char *encoded_message = strtok(NULL, "|");
-
-        if (!fromname || !toname || !encoded_message) {
-            printf("Received invalid message format.\n");
-            continue;
-        }
-
-        size_t decoded_length;
-        unsigned char *decoded_message = base64_decode(encoded_message, strlen(encoded_message), &decoded_length);
-
-        if (!decoded_message) {
-            printf("Failed to decode Base64 message.\n");
-            continue;
-        }
-
-        write_message_to_file(fromname, toname, (char *)decoded_message);
-        printf("Message from %s to %s: %s\n", fromname, toname, decoded_message);
-
-        free(decoded_message);
-    }
-
-    close(client_sock);
-    return NULL;
-}
-
-// 启动服务端的主函数
-int main() {
-    int server_sock, *new_sock;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t client_addr_len;
-
-    server_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_sock < 0) {
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
         perror("Socket creation failed");
-        exit(EXIT_FAILURE);
+        return;
     }
 
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
-    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_addr.s_addr = inet_addr(SERVER_ADDRESS);
 
-    if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Socket bind failed");
-        close(server_sock);
-        exit(EXIT_FAILURE);
+    if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Connection to server failed");
+        close(sock);
+        return;
     }
 
-    if (listen(server_sock, 3) < 0) {
-        perror("Socket listen failed");
-        close(server_sock);
-        exit(EXIT_FAILURE);
-    }
+    size_t encoded_length;
+    char *encoded_message = base64_encode((const unsigned char *)message, strlen(message), &encoded_length);
 
-    printf("Server listening on port %d\n", PORT);
+    snprintf(buffer, sizeof(buffer), "%s|%s|%s", fromname, toname, encoded_message);
+
+    send(sock, buffer, strlen(buffer), 0);
+
+    printf("Message sent\n");
+
+    free(encoded_message);
+    close(sock);
+}
+
+// 主函数
+int main() {
+    char fromname[256];
+    char toname[256];
+    char message[1024];
+
+    printf("Enter your name: ");
+    fgets(fromname, sizeof(fromname), stdin);
+    fromname[strcspn(fromname, "\n")] = '\0'; // Remove newline character
+
+    printf("Enter recipient name: ");
+    fgets(toname, sizeof(toname), stdin);
+    toname[strcspn(toname, "\n")] = '\0'; // Remove newline character
 
     while (1) {
-        client_addr_len = sizeof(client_addr);
-        new_sock = malloc(sizeof(int));
+        printf("Enter message (or 'exit' to quit): ");
+        fgets(message, sizeof(message), stdin);
 
-        if ((*new_sock = accept(server_sock, (struct sockaddr *)&client_addr, &client_addr_len)) < 0) {
-            perror("Server accept failed");
-            free(new_sock);
-            continue;
+        if (strncmp(message, "exit", 4) == 0) {
+            break;
         }
 
-        printf("New client connected: %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-
-        pthread_t client_thread;
-        if (pthread_create(&client_thread, NULL, handle_client, (void *)new_sock) != 0) {
-            perror("Could not create thread");
-            free(new_sock);
-        }
-        pthread_detach(client_thread); // 自动回收线程资源
+        message[strcspn(message, "\n")] = '\0'; // Remove newline character
+        send_message(fromname, toname, message);
     }
 
-    close(server_sock);
     return 0;
 }
