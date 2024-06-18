@@ -2,167 +2,231 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <fcntl.h>
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <pthread.h>
-#include <time.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #define PORT 33333
 
-// Base64 解码函数
-unsigned char *base64_decode(const char *data, size_t input_length, size_t *output_length) {
-    static const unsigned char decoding_table[] = {
-        64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
-        64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
-        64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 62, 64, 64, 64, 63,
-        52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 64, 64, 64, 0, 64, 64,
-        64, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 64, 64, 64, 64, 64,
-        64, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
-        40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 64, 64, 64, 64, 64
-    };
+struct message {
+    int action;          // 消息类型：1 表示注册，2 表示发送消息，3 表示群发消息，4 表示文件下载请求
+    char fromname[20];   // 发送消息的用户名
+    char toname[20];     // 接收消息的用户名
+    char msg[1024];      // 消息内容
+};
 
-    if (input_length % 4 != 0) return NULL;
+struct online {
+    int cfd;             // 客户端套接字文件描述符
+    char name[20];       // 用户名
+    struct online *next; // 指向下一个在线用户的指针
+};
 
-    *output_length = input_length / 4 * 3;
-    if (data[input_length - 1] == '=') (*output_length)--;
-    if (data[input_length - 2] == '=') (*output_length)--;
+struct online *head = NULL;  // 在线用户链表头指针
 
-    unsigned char *decoded_data = malloc(*output_length);
-    if (decoded_data == NULL) return NULL;
+// 插入用户到在线用户链表中
+void insert_user(struct online *new) {
+    if (head == NULL) {
+        new->next = NULL;
+        head = new;
+    } else {
+        new->next = head->next;
+        head->next = new;
+    }
+}
 
-    for (size_t i = 0, j = 0; i < input_length;) {
-        uint32_t sextet_a = data[i] == '=' ? 0 & i++ : decoding_table[(unsigned char)data[i++]];
-        uint32_t sextet_b = data[i] == '=' ? 0 & i++ : decoding_table[(unsigned char)data[i++]];
-        uint32_t sextet_c = data[i] == '=' ? 0 & i++ : decoding_table[(unsigned char)data[i++]];
-        uint32_t sextet_d = data[i] == '=' ? 0 & i++ : decoding_table[(unsigned char)data[i++]];
-
-        uint32_t triple = (sextet_a << 18) + (sextet_b << 12) + (sextet_c << 6) + sextet_d;
-
-        if (j < *output_length) decoded_data[j++] = (triple >> 16) & 0xFF;
-        if (j < *output_length) decoded_data[j++] = (triple >> 8) & 0xFF;
-        if (j < *output_length) decoded_data[j++] = triple & 0xFF;
+// 查找用户名对应的客户端套接字文件描述符
+int find_cfd(char *toname) {
+    if (head == NULL) {
+        return -1;
     }
 
-    return decoded_data;
+    struct online *temp = head;
+
+    while (temp != NULL) {
+        if (strcmp(temp->name, toname) == 0) {
+            return temp->cfd;
+        }
+        temp = temp->next;
+    }
+    return -1;
 }
 
-// 获取当前时间字符串
-void current_time_str(char *buffer, size_t size) {
-    time_t rawtime;
-    struct tm *timeinfo;
-    time(&rawtime);
-    timeinfo = localtime(&rawtime);
-    strftime(buffer, size, "%Y-%m-%d %H:%M:%S", timeinfo);
-}
+// 接收消息的线程函数
+void *recv_message(void *arg) {
+    int ret;
+    int to_cfd;
+    int cfd = *((int *)arg);
 
-// 将消息写入文件
-void write_message_to_file(const char *fromname, const char *toname, const char *message) {
-    FILE *file = fopen("messages.txt", "a");
-    if (!file) {
-        perror("Failed to open messages file");
-        return;
+    struct online *new;
+    struct message *msg = (struct message *)malloc(sizeof(struct message));
+
+    while (1) {
+        memset(msg, 0, sizeof(struct message));
+
+        // 接收客户端发送的消息
+        if ((ret = recv(cfd, msg, sizeof(struct message), 0)) < 0) {
+            perror("recv error!");
+            exit(1);
+        }
+
+        if (ret == 0) {
+            printf("%d is close!\n", cfd);
+            pthread_exit(NULL);
+        }
+
+        // 根据消息类型执行不同的操作
+        switch (msg->action) {
+            case 1: {  // 注册
+                new = (struct online *)malloc(sizeof(struct online));
+                new->cfd = cfd;
+                strcpy(new->name, msg->fromname);
+                insert_user(new);
+                msg->action = 1;
+                send(cfd, msg, sizeof(struct message), 0);  // 发送注册成功消息
+                break;
+            }
+            case 2: {  // 发送消息
+                to_cfd = find_cfd(msg->toname);
+                msg->action = 2;
+                send(to_cfd, msg, sizeof(struct message), 0);  // 转发消息到目标客户端
+
+                // 记录消息到文件
+                time_t timep;
+                time(&timep);
+                char buff[100];
+                strcpy(buff, ctime(&timep));
+                buff[strlen(buff) - 1] = 0;
+
+                char record[1024];
+                sprintf(record, "%s(%s->%s):%s", buff, msg->fromname, msg->toname, msg->msg);
+                printf("one record is:%s \n", record);
+
+                FILE *fp;
+                fp = fopen("a.txt", "a+");
+                if (fp == NULL) {
+                    printf("file open error!");
+                } else {
+                    fprintf(fp, "%s\n", record);
+                    printf("record have written into file. \n");
+                }
+                fclose(fp);
+                break;
+            }
+            case 3: {  // 群发消息
+                struct online *temp = head;
+
+                while (temp != NULL) {
+                    to_cfd = temp->cfd;
+                    msg->action = 3;
+                    send(to_cfd, msg, sizeof(struct message), 0);  // 发送群发消息到每个客户端
+                    temp = temp->next;
+                }
+                break;
+            }
+            case 4: {  // 文件下载请求
+                char filename[100];
+                strcpy(filename, msg->msg);
+
+                FILE *fp = fopen(filename, "rb");
+                if (fp == NULL) {
+                    perror("File open error");
+                    msg->action = -1;  // 表示文件不存在
+                    send(cfd, msg, sizeof(struct message), 0);
+                } else {
+                    msg->action = 4;  // 表示文件存在，开始发送
+                    send(cfd, msg, sizeof(struct message), 0);
+
+                    // 逐段读取文件内容并发送
+                    ssize_t bytesRead = 0;
+                    while ((bytesRead = fread(msg->msg, 1, sizeof(msg->msg), fp)) > 0) {
+                        send(cfd, msg, bytesRead, 0);
+                    }
+
+                    fclose(fp);
+                }
+                break;
+            }
+        }
+
+        usleep(3);
     }
 
-    char time_buffer[64];
-    current_time_str(time_buffer, sizeof(time_buffer));
-    fprintf(file, "Time: %s\nFrom: %s\nTo: %s\nMessage: %s\n\n", time_buffer, fromname, toname, message);
-    fclose(file);
+    pthread_exit(NULL);
 }
 
-// 处理客户端连接的线程函数
-void *handle_client(void *arg) {
-    int client_sock = *((int *)arg);
-    free(arg);
-    char buffer[4096];
+// 主函数
+int main() {
+    int cfd;
+    int sockfd;
+    int c_len;
+
+    char buffer[1024];
+
+    pthread_t id;
+
+    struct sockaddr_in s_addr;
+    struct sockaddr_in c_addr;
+
+    // 创建一个 TCP 套接字
+    if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        perror("socket error!");
+        exit(1);
+    }
+
+    printf("socket success!\n");
+
+    int opt = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));  // 设置套接字选项，允许地址重用
+
+    bzero(&s_addr, sizeof(struct sockaddr_in));
+    s_addr.sin_family = AF_INET;
+    s_addr.sin_port = htons(PORT);
+    s_addr.sin_addr.s_addr = INADDR_ANY;
+
+    // 绑定套接字到地址和端口
+    if (bind(sockfd, (struct sockaddr *)(&s_addr), sizeof(struct sockaddr_in)) < 0) {
+        perror("bind error!");
+        exit(1);
+    }
+
+    printf("bind success!\n");
+
+    // 监听端口
+    if (listen(sockfd, 3) < 0) {
+        perror("listen error!");
+        exit(1);
+    }
+
+    printf("listen success!\n");
 
     while (1) {
         memset(buffer, 0, sizeof(buffer));
-        int bytes_received = recv(client_sock, buffer, sizeof(buffer), 0);
 
-        if (bytes_received <= 0) {
-            printf("Client disconnected or error occurred.\n");
-            break;
+        bzero(&c_addr, sizeof(struct sockaddr_in));
+        c_len = sizeof(struct sockaddr_in);
+
+        printf("accepting........!\n");
+
+        // 接受客户端连接
+        if ((cfd = accept(sockfd, (struct sockaddr *)(&c_addr), &c_len)) < 0) {
+            perror("accept error!");
+            exit(1);
         }
 
-        char *fromname = strtok(buffer, "|");
-        char *toname = strtok(NULL, "|");
-        char *encoded_message = strtok(NULL, "|");
+        printf("port = %d ip = %s\n", ntohs(c_addr.sin_port), inet_ntoa(c_addr.sin_addr));
 
-        if (!fromname || !toname || !encoded_message) {
-            printf("Received invalid message format.\n");
-            continue;
+        // 创建接收消息的线程
+        if (pthread_create(&id, NULL, recv_message, (void *)(&cfd)) != 0) {
+            perror("pthread create error!");
+            exit(1);
         }
 
-        size_t decoded_length;
-        unsigned char *decoded_message = base64_decode(encoded_message, strlen(encoded_message), &decoded_length);
-
-        if (!decoded_message) {
-            printf("Failed to decode Base64 message.\n");
-            continue;
-        }
-
-        write_message_to_file(fromname, toname, (char *)decoded_message);
-        printf("Message from %s to %s: %s\n", fromname, toname, decoded_message);
-
-        free(decoded_message);
+        usleep(3);
     }
 
-    close(client_sock);
-    return NULL;
-}
-
-// 启动服务端的主函数
-int main() {
-    int server_sock, *new_sock;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t client_addr_len;
-
-    server_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_sock < 0) {
-        perror("Socket creation failed");
-        exit(EXIT_FAILURE);
-    }
-
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(PORT);
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Socket bind failed");
-        close(server_sock);
-        exit(EXIT_FAILURE);
-    }
-
-    if (listen(server_sock, 3) < 0) {
-        perror("Socket listen failed");
-        close(server_sock);
-        exit(EXIT_FAILURE);
-    }
-
-    printf("Server listening on port %d\n", PORT);
-
-    while (1) {
-        client_addr_len = sizeof(client_addr);
-        new_sock = malloc(sizeof(int));
-
-        if ((*new_sock = accept(server_sock, (struct sockaddr *)&client_addr, &client_addr_len)) < 0) {
-            perror("Server accept failed");
-            free(new_sock);
-            continue;
-        }
-
-        printf("New client connected: %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-
-        pthread_t client_thread;
-        if (pthread_create(&client_thread, NULL, handle_client, (void *)new_sock) != 0) {
-            perror("Could not create thread");
-            free(new_sock);
-        }
-        pthread_detach(client_thread); // 自动回收线程资源
-    }
-
-    close(server_sock);
     return 0;
 }
