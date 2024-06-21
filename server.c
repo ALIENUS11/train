@@ -2,231 +2,176 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/types.h>
-#include <sys/socket.h>
 #include <arpa/inet.h>
 #include <pthread.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <sys/stat.h>
+#include <sqlite3.h>
+#include <zlib.h>
 
-#define PORT 33333
+#define PORT 12345
+#define BUF_SIZE 1024
 
-struct message {
-    int action;          // 消息类型：1 表示注册，2 表示发送消息，3 表示群发消息，4 表示文件下载请求
-    char fromname[20];   // 发送消息的用户名
-    char toname[20];     // 接收消息的用户名
-    char msg[1024];      // 消息内容
+sqlite3 *db;
+
+void error_handling(char *message) {
+    perror(message);
+    exit(1);
+}
+
+// Base64编码表和解码表
+static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static const unsigned char base64_inv[256] = {
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 62, 64, 64, 64, 63,
+    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 64, 64, 64, 64, 64, 64,
+    64, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+    15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 64, 64, 64, 64, 64,
+    64, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+    41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64
 };
 
-struct online {
-    int cfd;             // 客户端套接字文件描述符
-    char name[20];       // 用户名
-    struct online *next; // 指向下一个在线用户的指针
-};
+// Base64解码函数
+unsigned char *base64_decode(const char *input, int *output_len) {
+    int len = strlen(input);
+    int i, j;
+    if (len % 4 != 0) return NULL;
 
-struct online *head = NULL;  // 在线用户链表头指针
+    *output_len = len / 4 * 3;
+    if (input[len - 1] == '=') (*output_len)--;
+    if (input[len - 2] == '=') (*output_len)--;
 
-// 插入用户到在线用户链表中
-void insert_user(struct online *new) {
-    if (head == NULL) {
-        new->next = NULL;
-        head = new;
-    } else {
-        new->next = head->next;
-        head->next = new;
+    unsigned char *decoded_data = (unsigned char *)malloc(*output_len);
+    if (decoded_data == NULL) return NULL;
+
+    for (i = 0, j = 0; i < len;) {
+        uint32_t sextet_a = input[i] == '=' ? 0 & i++ : base64_inv[(int)input[i++]];
+        uint32_t sextet_b = input[i] == '=' ? 0 & i++ : base64_inv[(int)input[i++]];
+        uint32_t sextet_c = input[i] == '=' ? 0 & i++ : base64_inv[(int)input[i++]];
+        uint32_t sextet_d = input[i] == '=' ? 0 & i++ : base64_inv[(int)input[i++]];
+
+        uint32_t triple = (sextet_a << 3 * 6)
+                        + (sextet_b << 2 * 6)
+                        + (sextet_c << 1 * 6)
+                        + (sextet_d << 0 * 6);
+
+        if (j < *output_len) decoded_data[j++] = (triple >> 2 * 8) & 0xFF;
+        if (j < *output_len) decoded_data[j++] = (triple >> 1 * 8) & 0xFF;
+        if (j < *output_len) decoded_data[j++] = (triple >> 0 * 8) & 0xFF;
     }
+
+    return decoded_data;
 }
 
-// 查找用户名对应的客户端套接字文件描述符
-int find_cfd(char *toname) {
-    if (head == NULL) {
-        return -1;
-    }
+// 处理客户端请求的线程函数
+void *handle_client(void *arg) {
+    int client_sock = *((int *)arg);
+    free(arg);
+    char buf[BUF_SIZE];
+    int str_len;
 
-    struct online *temp = head;
+    while ((str_len = read(client_sock, buf, BUF_SIZE)) != 0) {
+        if (strncmp(buf, "CHECK_VERSION", 13) == 0) {
+            // 版本检查逻辑
+            FILE *fp = fopen("v.txt", "r");
+            if (fp == NULL) {
+                error_handling("Failed to open version file");
+            }
+            fgets(buf, BUF_SIZE, fp);
+            fclose(fp);
+            write(client_sock, buf, strlen(buf));
+        } else if (strncmp(buf, "GET_NEW_CLIENT", 14) == 0) {
+            // 发送新的客户端程序
+            FILE *fp = fopen("client_new", "rb");
+            if (fp == NULL) {
+                error_handling("Failed to open new client file");
+            }
+            while ((str_len = fread(buf, 1, BUF_SIZE, fp)) > 0) {
+                if (write(client_sock, buf, str_len) == -1) {
+                    error_handling("write() error");
+                }
+            }
+            fclose(fp);
+        } else {
+            // 数据接收与处理逻辑
+            int decoded_len;
+            unsigned char *decoded_data = base64_decode(buf, &decoded_len);
+            if (decoded_data == NULL) {
+                error_handling("Base64 decode error");
+            }
+            unsigned long crc = crc32(0L, Z_NULL, 0);
+            crc = crc32(crc, (const unsigned char *)buf, str_len);
 
-    while (temp != NULL) {
-        if (strcmp(temp->name, toname) == 0) {
-            return temp->cfd;
+            printf("Received data: %s, CRC32: %lu\n", decoded_data, crc);
+
+            // 存储到SQLite数据库
+            sqlite3_stmt *stmt;
+            sqlite3_prepare_v2(db, "INSERT INTO data (field_data) VALUES (?)", -1, &stmt, NULL);
+            sqlite3_bind_text(stmt, 1, (const char *)decoded_data, -1, SQLITE_STATIC);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+            free(decoded_data);
         }
-        temp = temp->next;
     }
-    return -1;
+    close(client_sock);
+    return NULL;
 }
 
-// 接收消息的线程函数
-void *recv_message(void *arg) {
-    int ret;
-    int to_cfd;
-    int cfd = *((int *)arg);
-
-    struct online *new;
-    struct message *msg = (struct message *)malloc(sizeof(struct message));
-
-    while (1) {
-        memset(msg, 0, sizeof(struct message));
-
-        // 接收客户端发送的消息
-        if ((ret = recv(cfd, msg, sizeof(struct message), 0)) < 0) {
-            perror("recv error!");
-            exit(1);
-        }
-
-        if (ret == 0) {
-            printf("%d is close!\n", cfd);
-            pthread_exit(NULL);
-        }
-
-        // 根据消息类型执行不同的操作
-        switch (msg->action) {
-            case 1: {  // 注册
-                new = (struct online *)malloc(sizeof(struct online));
-                new->cfd = cfd;
-                strcpy(new->name, msg->fromname);
-                insert_user(new);
-                msg->action = 1;
-                send(cfd, msg, sizeof(struct message), 0);  // 发送注册成功消息
-                break;
-            }
-            case 2: {  // 发送消息
-                to_cfd = find_cfd(msg->toname);
-                msg->action = 2;
-                send(to_cfd, msg, sizeof(struct message), 0);  // 转发消息到目标客户端
-
-                // 记录消息到文件
-                time_t timep;
-                time(&timep);
-                char buff[100];
-                strcpy(buff, ctime(&timep));
-                buff[strlen(buff) - 1] = 0;
-
-                char record[1024];
-                sprintf(record, "%s(%s->%s):%s", buff, msg->fromname, msg->toname, msg->msg);
-                printf("one record is:%s \n", record);
-
-                FILE *fp;
-                fp = fopen("a.txt", "a+");
-                if (fp == NULL) {
-                    printf("file open error!");
-                } else {
-                    fprintf(fp, "%s\n", record);
-                    printf("record have written into file. \n");
-                }
-                fclose(fp);
-                break;
-            }
-            case 3: {  // 群发消息
-                struct online *temp = head;
-
-                while (temp != NULL) {
-                    to_cfd = temp->cfd;
-                    msg->action = 3;
-                    send(to_cfd, msg, sizeof(struct message), 0);  // 发送群发消息到每个客户端
-                    temp = temp->next;
-                }
-                break;
-            }
-            case 4: {  // 文件下载请求
-                char filename[100];
-                strcpy(filename, msg->msg);
-
-                FILE *fp = fopen(filename, "rb");
-                if (fp == NULL) {
-                    perror("File open error");
-                    msg->action = -1;  // 表示文件不存在
-                    send(cfd, msg, sizeof(struct message), 0);
-                } else {
-                    msg->action = 4;  // 表示文件存在，开始发送
-                    send(cfd, msg, sizeof(struct message), 0);
-
-                    // 逐段读取文件内容并发送
-                    ssize_t bytesRead = 0;
-                    while ((bytesRead = fread(msg->msg, 1, sizeof(msg->msg), fp)) > 0) {
-                        send(cfd, msg, bytesRead, 0);
-                    }
-
-                    fclose(fp);
-                }
-                break;
-            }
-        }
-
-        usleep(3);
-    }
-
-    pthread_exit(NULL);
-}
-
-// 主函数
 int main() {
-    int cfd;
-    int sockfd;
-    int c_len;
+    int server_sock, client_sock;
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t client_addr_size;
+    pthread_t t_id;
 
-    char buffer[1024];
+    // 打开SQLite数据库
+    if (sqlite3_open("server_data.db", &db) != SQLITE_OK) {
+        error_handling("Can't open database");
+    }
+    // 创建数据表
+    sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS data (id INTEGER PRIMARY KEY, field_data TEXT)", 0, 0, 0);
 
-    pthread_t id;
-
-    struct sockaddr_in s_addr;
-    struct sockaddr_in c_addr;
-
-    // 创建一个 TCP 套接字
-    if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("socket error!");
-        exit(1);
+    // 创建套接字
+    server_sock = socket(PF_INET, SOCK_STREAM, 0);
+    if (server_sock == -1) {
+        error_handling("socket() error");
     }
 
-    printf("socket success!\n");
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_addr.sin_port = htons(PORT);
 
-    int opt = 1;
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));  // 设置套接字选项，允许地址重用
-
-    bzero(&s_addr, sizeof(struct sockaddr_in));
-    s_addr.sin_family = AF_INET;
-    s_addr.sin_port = htons(PORT);
-    s_addr.sin_addr.s_addr = INADDR_ANY;
-
-    // 绑定套接字到地址和端口
-    if (bind(sockfd, (struct sockaddr *)(&s_addr), sizeof(struct sockaddr_in)) < 0) {
-        perror("bind error!");
-        exit(1);
+    // 绑定套接字
+    if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
+        error_handling("bind() error");
     }
 
-    printf("bind success!\n");
-
-    // 监听端口
-    if (listen(sockfd, 3) < 0) {
-        perror("listen error!");
-        exit(1);
+    // 监听连接
+    if (listen(server_sock, 5) == -1) {
+        error_handling("listen() error");
     }
-
-    printf("listen success!\n");
 
     while (1) {
-        memset(buffer, 0, sizeof(buffer));
-
-        bzero(&c_addr, sizeof(struct sockaddr_in));
-        c_len = sizeof(struct sockaddr_in);
-
-        printf("accepting........!\n");
-
-        // 接受客户端连接
-        if ((cfd = accept(sockfd, (struct sockaddr *)(&c_addr), &c_len)) < 0) {
-            perror("accept error!");
-            exit(1);
+        client_addr_size = sizeof(client_addr);
+        client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &client_addr_size);
+        if (client_sock == -1) {
+            error_handling("accept() error");
         }
 
-        printf("port = %d ip = %s\n", ntohs(c_addr.sin_port), inet_ntoa(c_addr.sin_addr));
-
-        // 创建接收消息的线程
-        if (pthread_create(&id, NULL, recv_message, (void *)(&cfd)) != 0) {
-            perror("pthread create error!");
-            exit(1);
-        }
-
-        usleep(3);
+        int *pclient = malloc(sizeof(int));
+        *pclient = client_sock;
+        pthread_create(&t_id, NULL, handle_client, pclient);
+        pthread_detach(t_id);
     }
 
+    close(server_sock);
+    sqlite3_close(db);
     return 0;
 }

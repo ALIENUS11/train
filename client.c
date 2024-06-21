@@ -2,290 +2,169 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/types.h>
-#include <sys/socket.h>
 #include <arpa/inet.h>
 #include <pthread.h>
-#include <curl/curl.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <signal.h>
+#include <zlib.h>
 
-#define PORT 33333
-#define VERSION_URL "http://test.sh.fangk.top/server_version.txt"
-#define UPDATE_URL "http://test.sh.fangk.top/client_new"
-#define LOCAL_VERSION "version.txt"
-#define CLIENT_PATH "./client"
-#define TEMP_CLIENT_PATH "./client_new_temp"
-#define UPDATE_FLAG "update_complete.flag"
+#define PORT 12345
+#define BUF_SIZE 1024
+#define VERSION_FILE "version.txt"
+#define NEW_CLIENT_FILE "client_new"
 
-// 写入回调函数，用于下载文件
-size_t write_data(void *ptr, size_t size, size_t nmemb, FILE *stream) {
-    return fwrite(ptr, size, nmemb, stream);
+// 错误处理函数
+void error_handling(char *message) {
+    perror(message);
+    exit(1);
 }
 
-// 检查并更新客户端
-void check_and_update() {
-    CURL *curl;
-    FILE *fp;
-    CURLcode res;
-    char server_version[64];
-    char local_version[64];
+// Base64编码表和解码表
+static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static const int mod_table[] = {0, 2, 1};
 
-    // 初始化 libcurl
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-    curl = curl_easy_init();
+// Base64编码函数
+char *base64_encode(const unsigned char *input, int len) {
+    int output_len = 4 * ((len + 2) / 3);
+    char *encoded_data = (char *)malloc(output_len + 1);
+    if (encoded_data == NULL) return NULL;
 
-    if (curl) {
-        // 下载服务器版本号文件并保存为本地的 version.txt
-        fp = fopen(LOCAL_VERSION, "w");
-        curl_easy_setopt(curl, CURLOPT_URL, VERSION_URL);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_data);
-        res = curl_easy_perform(curl);
-        fclose(fp);
+    for (int i = 0, j = 0; i < len;) {
+        uint32_t octet_a = i < len ? input[i++] : 0;
+        uint32_t octet_b = i < len ? input[i++] : 0;
+        uint32_t octet_c = i < len ? input[i++] : 0;
 
-        if (res == CURLE_OK) {
-            // 读取本地版本号
-            fp = fopen(LOCAL_VERSION, "r");
-            if (fp != NULL) {
-                fscanf(fp, "%s", local_version);
-                fclose(fp);
+        uint32_t triple = (octet_a << 0x10) + (octet_b << 0x08) + octet_c;
 
-                // 比较版本号
-                if (access("server_version.txt", F_OK) != -1) {
-                    // 删除旧的 server_version.txt 文件
-                    remove("server_version.txt");
-                }
-
-                // 重命名下载的版本号文件为 server_version.txt
-                if (rename(LOCAL_VERSION, "server_version.txt") != 0) {
-                    perror("Failed to rename version file");
-                    exit(EXIT_FAILURE);
-                }
-
-                // 读取服务器版本号
-                fp = fopen("server_version.txt", "r");
-                fscanf(fp, "%s", server_version);
-                fclose(fp);
-
-                // 比较本地和服务器版本号
-                if (strcmp(server_version, local_version) != 0) {
-                    // 版本不同，下载新版本
-                    printf("Downloading new version...\n");
-                    fp = fopen(TEMP_CLIENT_PATH, "wb");
-                    curl_easy_setopt(curl, CURLOPT_URL, UPDATE_URL);
-                    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-                    res = curl_easy_perform(curl);
-                    fclose(fp);
-
-                    if (res == CURLE_OK) {
-                        printf("Update downloaded.\n");
-
-                        // 验证下载文件的大小
-                        struct stat st;
-                        if (stat(TEMP_CLIENT_PATH, &st) == 0 && st.st_size > 0) {
-                            // 创建标志文件
-                            int fd = open(UPDATE_FLAG, O_CREAT | O_WRONLY, 0644);
-                            if (fd != -1) {
-                                close(fd);
-                            }
-
-                            // 替换旧版本并重启
-                            if (rename(TEMP_CLIENT_PATH, CLIENT_PATH) == 0) {
-                                printf("Update applied successfully.\n");
-                                execl(CLIENT_PATH, CLIENT_PATH, NULL);
-                            } else {
-                                perror("Failed to apply update");
-                            }
-                        } else {
-                            printf("Downloaded file is invalid.\n");
-                        }
-                    } else {
-                        printf("Failed to download update.\n");
-                    }
-
-                    // 退出当前客户端
-                    exit(EXIT_FAILURE);
-                } else {
-                    printf("Client is up to date.\n");
-                }
-            } else {
-                // 如果本地版本文件不存在，创建并写入服务器版本号
-                printf("Local version not found, creating new one.\n");
-                fp = fopen(LOCAL_VERSION, "w");
-                fprintf(fp, "%s", server_version);
-                fclose(fp);
-            }
-        } else {
-            printf("Failed to fetch server version.\n");
-        }
-
-        curl_easy_cleanup(curl);
-    } else {
-        printf("Failed to initialize libcurl.\n");
+        encoded_data[j++] = base64_chars[(triple >> 3 * 6) & 0x3F];
+        encoded_data[j++] = base64_chars[(triple >> 2 * 6) & 0x3F];
+        encoded_data[j++] = base64_chars[(triple >> 1 * 6) & 0x3F];
+        encoded_data[j++] = base64_chars[(triple >> 0 * 6) & 0x3F];
     }
 
-    curl_global_cleanup();
+    for (int i = 0; i < mod_table[len % 3]; i++)
+        encoded_data[output_len - 1 - i] = '=';
+
+    encoded_data[output_len] = '\0';
+    return encoded_data;
 }
 
-struct message {
-    int action;
-    char fromname[20];
-    char toname[20];
-    char msg[1024];
-};
+// 检查并下载更新的客户端程序
+void check_for_update() {
+    int sock;
+    struct sockaddr_in serv_addr;
+    char message[BUF_SIZE];
+    FILE *fp;
+    char server_version[BUF_SIZE];
 
-void *recv_message(void *arg) {
-    time_t t;
-    char buf[1024];
-    time(&t);
-    ctime_r(&t, buf);
+    // 创建套接字
+    sock = socket(PF_INET, SOCK_STREAM, 0);
+    if (sock == -1) {
+        error_handling("socket() error");
+    }
 
-    int ret;
-    int cfd = *((int *)arg);
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    serv_addr.sin_port = htons(PORT);
 
-    struct message *msg = (struct message *)malloc(sizeof(struct message));
+    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == -1) {
+        error_handling("connect() error");
+    }
+
+    // 发送版本检查请求
+    write(sock, "CHECK_VERSION", strlen("CHECK_VERSION"));
+    int str_len = read(sock, server_version, BUF_SIZE - 1);
+    server_version[str_len] = 0;
+
+    // 打开本地版本文件
+    fp = fopen(VERSION_FILE, "r");
+    if (fp == NULL) {
+        error_handling("Failed to open version file");
+    }
+    char local_version[BUF_SIZE];
+    fgets(local_version, BUF_SIZE, fp);
+    fclose(fp);
+
+    // 检查版本是否一致
+    if (strcmp(server_version, local_version) != 0) {
+        printf("New version available. Downloading...\n");
+        write(sock, "GET_NEW_CLIENT", strlen("GET_NEW_CLIENT"));
+        fp = fopen(NEW_CLIENT_FILE, "wb");
+        if (fp == NULL) {
+            error_handling("Failed to open new client file for writing");
+        }
+        while ((str_len = read(sock, message, BUF_SIZE)) > 0) {
+            fwrite(message, 1, str_len, fp);
+        }
+        fclose(fp);
+        // 更新版本文件
+        fp = fopen(VERSION_FILE, "w");
+        if (fp == NULL) {
+            error_handling("Failed to open version file for writing");
+        }
+        fputs(server_version, fp);
+        fclose(fp);
+        printf("Update downloaded. Please restart the client.\n");
+        close(sock);
+        exit(0);
+    }
+    close(sock);
+}
+
+// 发送数据的线程函数
+void *send_data(void *arg) {
+    int sock;
+    struct sockaddr_in serv_addr;
+    char message[BUF_SIZE];
+    unsigned long crc;
+
+    // 创建套接字
+    sock = socket(PF_INET, SOCK_STREAM, 0);
+    if (sock == -1) {
+        error_handling("socket() error");
+    }
+
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    serv_addr.sin_port = htons(PORT);
+
+    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == -1) {
+        error_handling("connect() error");
+    }
 
     while (1) {
-        memset(msg, 0, sizeof(struct message));
+        printf("Enter data to send: ");
+        fgets(message, BUF_SIZE, stdin);
+        message[strlen(message) - 1] = 0;
 
-        if ((ret = recv(cfd, msg, sizeof(struct message), 0)) < 0) {
-            perror("recv error!");
-            exit(EXIT_FAILURE);
+        crc = crc32(0L, Z_NULL, 0);
+        crc = crc32(crc, (const unsigned char *)message, strlen(message));
+        printf("Sending data: %s, CRC32: %lu\n", message, crc);
+
+        // Base64编码
+        char *encoded_data = base64_encode((const unsigned char *)message, strlen(message));
+        if (encoded_data == NULL) {
+            error_handling("Base64 encode error");
         }
 
-        if (ret == 0) {
-            printf("%d is close!\n", cfd);
-            pthread_exit(NULL);
-        }
-
-        switch (msg->action) {
-            case 1:
-                printf("reg success!\n");
-                break;
-            case 2:
-                printf("time:%s recv:%s\n", buf, msg->msg);
-                break;
-            case 3:
-                printf("time:%s all recv:%s\n", buf, msg->msg);
-                break;
-        }
-        usleep(3);
+        write(sock, encoded_data, strlen(encoded_data));
+        free(encoded_data);
     }
-
-    pthread_exit(NULL);
-}
-
-// 信号处理函数，用于捕获 Ctrl+C 中断信号
-volatile sig_atomic_t update_in_progress = 0;
-
-void sig_handler(int signum) {
-    if (signum == SIGINT || signum == SIGTERM) {
-        update_in_progress = 1;
-    }
+    close(sock);
+    return NULL;
 }
 
 int main() {
-    // 注册信号处理函数
-    signal(SIGINT, sig_handler);
-    signal(SIGTERM, sig_handler);
+    pthread_t send_thread;
 
-    // 检查并更新
-    printf("Checking for updates...\n");
-    check_and_update();
+    // 检查更新
+    check_for_update();
 
-    int sockfd;
-    pthread_t id;
-    struct sockaddr_in s_addr;
-
-    if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("socket error!");
-        exit(EXIT_FAILURE);
+    // 创建数据发送线程
+    if (pthread_create(&send_thread, NULL, send_data, NULL) != 0) {
+        error_handling("pthread_create() error");
     }
-
-    printf("client socket success!\n");
-
-    bzero(&s_addr, sizeof(struct sockaddr_in));
-    s_addr.sin_family = AF_INET;
-    s_addr.sin_port = htons(PORT);
-    s_addr.sin_addr.s_addr = inet_addr("101.133.168.114");
-
-    if (connect(sockfd, (struct sockaddr *)(&s_addr), sizeof(struct sockaddr_in)) < 0) {
-        perror("connect error!");
-        exit(EXIT_FAILURE);
-    }
-
-    printf("connect success!\n");
-
-    if (pthread_create(&id, NULL, recv_message, (void *)(&sockfd)) != 0) {
-        perror("pthread create error!");
-        exit(EXIT_FAILURE);
-    }
-
-    char cmd[20];
-    char name[20];
-    char toname[20];
-    char message[1024];
-
-    struct message *msg = (struct message *)malloc(sizeof(struct message));
-
-    while (1) {
-        printf("Please input cmd:\n");
-        scanf("%s", cmd);
-
-        if (strcmp(cmd, "reg") == 0) {
-            printf("Please input reg name:\n");
-            scanf("%s", name);
-
-            msg->action = 1;
-            strcpy(msg->fromname, name);
-
-            if (send(sockfd, msg, sizeof(struct message), 0) < 0) {
-                perror("send error reg!\n");
-                exit(EXIT_FAILURE);
-            }
-        }
-
-        if (strcmp(cmd, "send") == 0) {
-            printf("Please input send to name:\n");
-            scanf("%s", toname);
-
-            printf("Please input send message:\n");
-            scanf("%s", message);
-
-            msg->action = 2;
-            strcpy(msg->toname, toname);
-            strcpy(msg->msg, message);
-
-            if (send(sockfd, msg, sizeof(struct message), 0) < 0) {
-                perror("send error send!\n");
-                exit(EXIT_FAILURE);
-            }
-        }
-
-        if (strcmp(cmd, "all") == 0) {
-            printf("Please input all message:\n");
-            scanf("%s", message);
-
-            msg->action = 3;
-            strcpy(msg->msg, message);
-
-            if (send(sockfd, msg, sizeof(struct message), 0) < 0) {
-                perror("send error all!\n");
-                exit(EXIT_FAILURE);
-            }
-        }
-
-        // 如果接收到中断信号，则退出循环
-        if (update_in_progress) {
-            printf("Interrupt signal received. Exiting...\n");
-            break;
-        }
-    }
-
-    // 关闭套接字
-    shutdown(sockfd, SHUT_RDWR);
+    pthread_join(send_thread, NULL);
 
     return 0;
 }
