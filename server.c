@@ -17,9 +17,10 @@ void error_handling(char *message) {
     exit(1);
 }
 
-// Base64编码表和解码表
+// Base64解码表
 static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 static const unsigned char base64_inv[256] = {
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
     64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
     64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
     64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 62, 64, 64, 64, 63,
@@ -34,15 +35,15 @@ static const unsigned char base64_inv[256] = {
     64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
     64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
     64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
-    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
     64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64
 };
 
 // Base64解码函数
 unsigned char *base64_decode(const char *input, int *output_len) {
     int len = strlen(input);
-    int i, j;
-    if (len % 4 != 0) return NULL;
+    if (len % 4 != 0) {
+        return NULL;
+    }
 
     *output_len = len / 4 * 3;
     if (input[len - 1] == '=') (*output_len)--;
@@ -51,7 +52,7 @@ unsigned char *base64_decode(const char *input, int *output_len) {
     unsigned char *decoded_data = (unsigned char *)malloc(*output_len);
     if (decoded_data == NULL) return NULL;
 
-    for (i = 0, j = 0; i < len;) {
+    for (int i = 0, j = 0; i < len;) {
         uint32_t sextet_a = input[i] == '=' ? 0 & i++ : base64_inv[(int)input[i++]];
         uint32_t sextet_b = input[i] == '=' ? 0 & i++ : base64_inv[(int)input[i++]];
         uint32_t sextet_c = input[i] == '=' ? 0 & i++ : base64_inv[(int)input[i++]];
@@ -78,6 +79,9 @@ void *handle_client(void *arg) {
     int str_len;
 
     while ((str_len = read(client_sock, buf, BUF_SIZE)) != 0) {
+        buf[str_len] = '\0';  // Null-terminate the received data
+        printf("Received encoded data: %s\n", buf);
+
         if (strncmp(buf, "CHECK_VERSION", 13) == 0) {
             // 版本检查逻辑
             FILE *fp = fopen("v.txt", "r");
@@ -86,6 +90,7 @@ void *handle_client(void *arg) {
             }
             fgets(buf, BUF_SIZE, fp);
             fclose(fp);
+            printf("Sending server version: %s\n", buf);
             write(client_sock, buf, strlen(buf));
         } else if (strncmp(buf, "GET_NEW_CLIENT", 14) == 0) {
             // 发送新的客户端程序
@@ -98,6 +103,7 @@ void *handle_client(void *arg) {
                     error_handling("write() error");
                 }
             }
+            printf("Sent new client to client.\n");
             fclose(fp);
         } else {
             // 数据接收与处理逻辑
@@ -107,7 +113,7 @@ void *handle_client(void *arg) {
                 error_handling("Base64 decode error");
             }
             unsigned long crc = crc32(0L, Z_NULL, 0);
-            crc = crc32(crc, (const unsigned char *)buf, str_len);
+            crc = crc32(crc, decoded_data, decoded_len);
 
             printf("Received data: %s, CRC32: %lu\n", decoded_data, crc);
 
@@ -158,12 +164,16 @@ int main() {
         error_handling("listen() error");
     }
 
+    printf("Server is running and waiting for connections...\n");
+
     while (1) {
         client_addr_size = sizeof(client_addr);
         client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &client_addr_size);
         if (client_sock == -1) {
             error_handling("accept() error");
         }
+
+        printf("Client connected.\n");
 
         int *pclient = malloc(sizeof(int));
         *pclient = client_sock;

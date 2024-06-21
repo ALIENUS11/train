@@ -107,6 +107,7 @@ void check_for_update() {
         close(sock);
         exit(0);
     }
+    printf("Client is up to date.\n");
     close(sock);
 }
 
